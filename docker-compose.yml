@@ -1,0 +1,136 @@
+# DeployForge DEVELOPMENT stack. For production see docker-compose.prod.yml and docs/operations.md.
+#
+#   ./scripts/dev.sh up        build and start everything
+#   ./scripts/dev.sh down      stop (data kept)       ./scripts/dev.sh reset   stop and DELETE all data
+#
+# Trust boundaries (see docs/security.md):
+#   control   - trusted services only (web, worker, edge, db, redis, agent API). No user code runs here.
+#   deployforge-build-egress - where build containers live: internet allowed, private ranges firewalled.
+#   deployforge-runtime      - where user apps run: internal (no internet), reachable only by edge + agent.
+name: deployforge
+
+x-env: &env
+  env_file: .env
+  environment:
+    NODE_ENV: development
+    DATABASE_URL: postgresql://${POSTGRES_USER:-deployforge}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-deployforge}?schema=public
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-deployforge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-deployforge}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    networks: [control]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-deployforge}']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ['redis-server', '--appendonly', 'yes', '--maxmemory-policy', 'noeviction']
+    volumes: [redisdata:/data]
+    networks: [control]
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: { context: ., target: migrate }
+    <<: *env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-deployforge}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-deployforge}?schema=public
+      SEED: 'true'
+    depends_on: { postgres: { condition: service_healthy } }
+    networks: [control]
+    restart: 'no'
+
+  web:
+    build: { context: ., target: web }
+    <<: *env
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    networks: [control]
+    restart: unless-stopped
+
+  worker:
+    build: { context: ., target: worker }
+    <<: *env
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      sandbox-agent: { condition: service_healthy }
+    volumes:
+      - artifacts:/data/artifacts
+      - ./.data/dev-repos:/dev-repos:ro
+    networks: [control]
+    restart: unless-stopped
+
+  edge:
+    build: { context: ., target: edge }
+    <<: *env
+    depends_on: { migrate: { condition: service_completed_successfully } }
+    volumes: [artifacts:/data/artifacts:ro]
+    networks: [control, deployforge-runtime]
+    restart: unless-stopped
+
+  # The ONLY service with the Docker socket. Internal network only, bearer-token protected, never runs user code itself.
+  sandbox-agent:
+    build: { context: services/sandbox-agent }
+    environment:
+      SANDBOX_AGENT_TOKEN: ${SANDBOX_AGENT_TOKEN}
+      WORKSPACE_ROOT: /var/lib/deployforge/workspaces
+      WORKSPACE_HOST_ROOT: ${HOST_DATA_DIR}/workspaces
+      RUNTIME_ROOT: /var/lib/deployforge/runtimes
+      RUNTIME_HOST_ROOT: ${HOST_DATA_DIR}/runtimes
+      BUNDLE_ROOT: /var/lib/deployforge/bundles
+      DEV_LOCAL_GIT_ROOT: /dev-repos
+      DEV_LOCAL_GIT_HOST_ROOT: ${HOST_DATA_DIR}/dev-repos
+      BUILD_EGRESS_NETWORK: deployforge-build-egress
+      RUNTIME_NETWORK: deployforge-runtime
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./.data/workspaces:/var/lib/deployforge/workspaces
+      - ./.data/runtimes:/var/lib/deployforge/runtimes
+      - bundles:/var/lib/deployforge/bundles
+      - ./.data/dev-repos:/dev-repos:ro
+    networks: [control, deployforge-runtime]
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'python', '-c', "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8700/healthz',timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  caddy:
+    image: caddy:2-alpine
+    ports: ['8080:80']
+    volumes:
+      - ./infra/caddy/Caddyfile.dev:/etc/caddy/Caddyfile:ro
+    depends_on: [web, edge]
+    networks: [control]
+    restart: unless-stopped
+
+networks:
+  control: {}
+  deployforge-runtime:
+    name: deployforge-runtime
+    internal: true # user apps get NO route to the internet or the host
+  deployforge-build-egress:
+    name: deployforge-build-egress
+    driver: bridge
+    driver_opts: { com.docker.network.bridge.name: df-build0 }
+    ipam: { config: [{ subnet: 172.30.0.0/24 }] }
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  artifacts: {}
+  bundles: {}

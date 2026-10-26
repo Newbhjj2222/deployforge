@@ -1,0 +1,38 @@
+{
+  "name": "deployforge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DeployForge - a self-hostable, Vercel-inspired deployment platform.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev -w @deployforge/web",
+    "dev:worker": "npm run dev -w @deployforge/worker",
+    "dev:edge": "npm run dev -w @deployforge/edge",
+    "build": "npm run db:generate && npm run build -w @deployforge/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "test:py": "cd services/sandbox-agent && python -m pytest -q",
+    "test:e2e": "npm run test:e2e -w @deployforge/web",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "db:generate": "npm run generate -w @deployforge/db",
+    "db:migrate": "npm run migrate:deploy -w @deployforge/db",
+    "db:migrate:dev": "npm run migrate:dev -w @deployforge/db",
+    "db:seed": "npm run seed -w @deployforge/db",
+    "db:test": "npm run test:db -w @deployforge/db",
+    "dev:stack": "docker compose up --build",
+    "dev:stack:down": "docker compose down",
+    "dev:stack:reset": "docker compose down -v && docker compose up --build"
+  },
+  "devDependencies": {
+    "prettier": "^3.6.2"
+  }
+}

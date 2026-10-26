@@ -1,0 +1,99 @@
+name: CI
+on:
+  push: { branches: [main] }
+  pull_request:
+
+permissions: { contents: read }
+
+concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env: { POSTGRES_USER: df, POSTGRES_PASSWORD: df, POSTGRES_DB: df }
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U df" --health-interval 5s --health-timeout 3s --health-retries 20
+      shadow:
+        image: postgres:16-alpine
+        env: { POSTGRES_USER: df, POSTGRES_PASSWORD: df, POSTGRES_DB: shadow }
+        ports: ['5433:5432']
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+    env:
+      DATABASE_URL: postgresql://df:df@localhost:5432/df
+      SHADOW_DATABASE_URL: postgresql://df:df@localhost:5433/shadow
+      REDIS_URL: redis://localhost:6379
+      ENCRYPTION_KEYS: 1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      ENCRYPTION_KEY_ACTIVE: '1'
+      AUTH_SECRET: ci-only-secret
+      ROOT_DOMAIN: localhost
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm install --no-audit --no-fund
+      - run: npm run db:generate
+      - name: Apply migrations to an empty database
+        run: npm run db:migrate
+      - name: Migrations match schema.prisma (no drift)
+        run: npm run migrate:check -w @deployforge/db
+      - name: Database constraint tests
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f packages/db/test/constraints.sql
+      - run: npm run format:check
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - name: Production build
+        run: npm run build
+
+  python:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: services/sandbox-agent } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', cache: pip, cache-dependency-path: services/sandbox-agent/pyproject.toml }
+      - run: pip install -e '.[dev]'
+      - run: ruff check .
+      - run: pytest -q
+
+  e2e:
+    needs: [node, python]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Start stack (real Docker sandbox)
+        run: |
+          ./scripts/dev.sh init
+          echo "GITHUB_WEBHOOK_SECRET=ci-webhook-secret-123" >> .env
+          ./scripts/dev.sh up
+          ./scripts/dev.sh repo static-site
+          for i in $(seq 1 60); do curl -fsS http://app.localhost:8080/api/health && break || sleep 3; done
+      - name: Acceptance
+        run: node scripts/acceptance.mjs
+      - if: failure()
+        run: docker compose logs --tail=200
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install --no-audit --no-fund
+      - run: npm audit --omit=dev --audit-level=high
+      - name: Build images and scan
+        run: |
+          docker build --target web -t df-web .
+          docker build --target worker -t df-worker .
+          docker build -t df-agent services/sandbox-agent
+      - uses: aquasecurity/trivy-action@0.28.0
+        with: { image-ref: df-agent, severity: 'CRITICAL,HIGH', exit-code: '1', ignore-unfixed: true }

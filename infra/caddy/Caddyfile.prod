@@ -1,0 +1,38 @@
+# Production reverse proxy. Terminates TLS and redirects HTTP -> HTTPS automatically (Caddy default).
+#
+# Certificates
+#   * Dashboard:                 issued normally for {$APP_HOST}.
+#   * Platform subdomains:       use a WILDCARD certificate (*.{$ROOT_DOMAIN}) via DNS-01. This needs a Caddy build with your DNS
+#                                provider plugin (https://caddyserver.com/download). Without it, previews fall under on-demand
+#                                issuance and Let's Encrypt rate limits (50 certs / registered domain / week) will bite.
+#   * Customer custom domains:   issued ON DEMAND at first request, but only if the edge confirms the hostname belongs to a
+#                                VERIFIED, ACTIVE domain (the `ask` endpoint). Unknown names never trigger issuance.
+{
+	email {$ACME_EMAIL}
+	on_demand_tls {
+		ask http://edge:8081/internal/tls-ask?token={$INTERNAL_TOKEN}
+	}
+}
+
+{$APP_HOST} {
+	encode zstd gzip
+	reverse_proxy web:3000
+}
+
+# --- wildcard for platform subdomains (requires DNS plugin; remove this block to use on-demand only) ---
+# *.{$ROOT_DOMAIN} {
+#	tls {
+#		dns cloudflare {$CLOUDFLARE_API_TOKEN}
+#	}
+#	reverse_proxy edge:8080
+# }
+
+# customer domains + (optionally) platform subdomains via on-demand TLS
+https:// {
+	tls {
+		on_demand
+	}
+	reverse_proxy edge:8080 {
+		header_up X-Forwarded-Proto https
+	}
+}

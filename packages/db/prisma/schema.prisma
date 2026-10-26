@@ -1,0 +1,527 @@
+// DeployForge database schema.
+//
+// Authority (see docs/architecture.md):
+//   PostgreSQL = source of truth for all state, history and intent (including the outbox).
+//   Redis/BullMQ = delivery only (what is waiting / active / failed right now).
+//
+// IDs are CUIDs everywhere. Deleting an Organization is RESTRICTED while it owns projects;
+// deleting a Project cascades to its deployments, logs, domains and env vars (artifacts are removed
+// from object storage by the `project.cleanup` job *before* the row is hard-deleted).
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-3.0.x", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────── Enums ─────────────────────────
+
+enum OrgRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+enum Framework {
+  STATIC
+  VITE
+  REACT
+  NEXTJS
+  FASTAPI
+  FLASK
+  OTHER
+}
+
+enum RuntimeKind {
+  STATIC
+  PYTHON
+}
+
+enum DeploymentStatus {
+  QUEUED
+  CLONING
+  INSTALLING
+  BUILDING
+  UPLOADING
+  DEPLOYING
+  READY
+  FAILED
+  CANCELING
+  CANCELED
+}
+
+enum DeploymentEnvironment {
+  PRODUCTION
+  PREVIEW
+}
+
+enum DeploymentTrigger {
+  MANUAL
+  WEBHOOK
+  ROLLBACK
+}
+
+enum RuntimeStatus {
+  NONE
+  STARTING
+  RUNNING
+  STOPPED
+  FAILED
+}
+
+enum EnvScope {
+  BUILD
+  RUNTIME
+  BUILD_AND_RUNTIME
+}
+
+enum DomainStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  SUSPENDED
+}
+
+enum TlsStatus {
+  UNKNOWN
+  PENDING
+  ACTIVE
+  EXPIRING
+  FAILED
+}
+
+enum InstallationStatus {
+  ACTIVE
+  SUSPENDED
+  REVOKED
+}
+
+enum BuildJobStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELED
+  DEAD
+}
+
+enum WebhookStatus {
+  RECEIVED
+  PROCESSED
+  IGNORED
+  FAILED
+}
+
+enum OutboxStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+enum LogLevel {
+  DEBUG
+  INFO
+  WARN
+  ERROR
+}
+
+enum LogStream {
+  SYSTEM
+  STDOUT
+  STDERR
+}
+
+enum UsageMetric {
+  DEPLOYMENT
+  BUILD_SECONDS
+  ARTIFACT_BYTES
+}
+
+enum ProjectState {
+  ACTIVE
+  DELETING
+}
+
+// ───────────────────────── Auth (Auth.js Prisma adapter shape) ─────────────────────────
+
+model User {
+  id                String    @id @default(cuid())
+  name              String?
+  email             String?   @unique
+  emailVerified     DateTime?
+  image             String?
+  passwordHash      String?
+  failedLoginCount  Int       @default(0)
+  lockedUntil       DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  accounts    Account[]
+  sessions    Session[]
+  memberships OrganizationMember[]
+  auditLogs   AuditLog[]           @relation("AuditActor")
+  deployments Deployment[]         @relation("DeploymentCreator")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+// Used by the adapter; the app runs JWT sessions (required for the credentials provider).
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ───────────────────────── Tenancy ─────────────────────────
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  personal  Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members       OrganizationMember[]
+  projects      Project[]
+  installations GitHubInstallation[]
+  connections   RepositoryConnection[]
+  auditLogs     AuditLog[]
+  usage         UsageRecord[]
+}
+
+model OrganizationMember {
+  id        String   @id @default(cuid())
+  orgId     String
+  userId    String
+  role      OrgRole  @default(MEMBER)
+  createdAt DateTime @default(now())
+
+  org  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, userId])
+  @@index([userId])
+}
+
+// ───────────────────────── Projects ─────────────────────────
+
+model Project {
+  id               String       @id @default(cuid())
+  orgId            String
+  name             String
+  slug             String       @unique
+  state            ProjectState @default(ACTIVE)
+  framework        Framework    @default(OTHER)
+  runtime          RuntimeKind  @default(STATIC)
+  productionBranch String       @default("main")
+  installCommand   String?
+  buildCommand     String?
+  outputDirectory  String?
+  startCommand     String?
+  pythonVersion    String?
+  nodeVersion      String       @default("22")
+  port             Int          @default(8000)
+  healthCheckPath  String       @default("/health")
+  spaFallback      Boolean      @default(false)
+  previewDeployments Boolean    @default(true)
+  activeDeploymentId String?    @unique
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  org              Organization          @relation(fields: [orgId], references: [id], onDelete: Restrict)
+  activeDeployment Deployment?           @relation("ActiveDeployment", fields: [activeDeploymentId], references: [id], onDelete: SetNull)
+  connection       RepositoryConnection?
+  deployments      Deployment[]          @relation("ProjectDeployments")
+  domains          Domain[]
+  envVars          EnvironmentVariable[]
+  usage            UsageRecord[]
+
+  @@index([orgId, createdAt(sort: Desc)])
+  @@index([state])
+}
+
+model GitHubInstallation {
+  id             String             @id @default(cuid())
+  installationId BigInt             @unique
+  orgId          String
+  accountLogin   String
+  accountId      BigInt
+  accountType    String
+  status         InstallationStatus @default(ACTIVE)
+  connectedById  String?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  org         Organization           @relation(fields: [orgId], references: [id], onDelete: Restrict)
+  connections RepositoryConnection[]
+
+  @@index([orgId])
+}
+
+model RepositoryConnection {
+  id              String    @id @default(cuid())
+  projectId       String    @unique
+  orgId           String
+  installationRef String
+  githubRepoId    BigInt
+  fullName        String
+  defaultBranch   String
+  isPrivate       Boolean   @default(true)
+  rootDirectory   String    @default("")
+  disabledAt      DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  project      Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  org          Organization       @relation(fields: [orgId], references: [id], onDelete: Restrict)
+  installation GitHubInstallation @relation(fields: [installationRef], references: [id], onDelete: Restrict)
+
+  // one project per repository + root directory inside an organisation
+  @@unique([orgId, githubRepoId, rootDirectory])
+  @@index([githubRepoId])
+  @@index([installationRef])
+}
+
+// ───────────────────────── Deployments ─────────────────────────
+
+model Deployment {
+  id               String                @id @default(cuid())
+  projectId        String
+  environment      DeploymentEnvironment @default(PRODUCTION)
+  trigger          DeploymentTrigger     @default(MANUAL)
+  status           DeploymentStatus      @default(QUEUED)
+  branch           String
+  commitSha        String
+  commitMessage    String?
+  commitAuthor     String?
+  idempotencyKey   String                @unique
+  createdById      String?
+  previewHostname  String                @unique
+  /// Immutable snapshot of the project's build settings at creation time.
+  settings         Json
+  runtime          RuntimeKind           @default(STATIC)
+  attempt          Int                   @default(0)
+  progress         Int                   @default(0)
+  failureCode      String?
+  failureReason    String?
+  cancelRequestedAt DateTime?
+  rollbackOfId     String?
+  artifactPrefix   String?
+  artifactChecksum String?
+  artifactBytes    BigInt?
+  fileCount        Int?
+  runtimeStatus    RuntimeStatus         @default(NONE)
+  startedAt        DateTime?
+  readyAt          DateTime?
+  finishedAt       DateTime?
+  createdAt        DateTime              @default(now())
+  updatedAt        DateTime              @updatedAt
+
+  project    Project          @relation("ProjectDeployments", fields: [projectId], references: [id], onDelete: Cascade)
+  createdBy  User?            @relation("DeploymentCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  rollbackOf Deployment?      @relation("Rollback", fields: [rollbackOfId], references: [id], onDelete: SetNull)
+  rollbacks  Deployment[]     @relation("Rollback")
+  activeFor  Project?         @relation("ActiveDeployment")
+  logs       DeploymentLog[]
+  buildJobs  BuildJob[]
+
+  @@index([projectId, createdAt(sort: Desc)])
+  @@index([projectId, environment, status])
+  @@index([status])
+}
+
+model DeploymentLog {
+  id           String    @id @default(cuid())
+  deploymentId String
+  seq          Int
+  ts           DateTime  @default(now())
+  level        LogLevel  @default(INFO)
+  stream       LogStream @default(SYSTEM)
+  message      String
+
+  deployment Deployment @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+
+  @@unique([deploymentId, seq])
+  @@index([ts])
+}
+
+/// One row per build *attempt*. PostgreSQL records what happened; BullMQ only delivers.
+model BuildJob {
+  id           String         @id @default(cuid())
+  deploymentId String
+  attempt      Int
+  status       BuildJobStatus @default(PENDING)
+  queueJobId   String
+  workerId     String?
+  error        String?
+  startedAt    DateTime?
+  finishedAt   DateTime?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  deployment Deployment @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+
+  @@unique([deploymentId, attempt])
+  @@index([status, createdAt])
+  @@index([queueJobId])
+}
+
+// ───────────────────────── Domains & env ─────────────────────────
+
+model Domain {
+  id                   String       @id @default(cuid())
+  projectId            String
+  hostname             String
+  /// Set to `hostname` only while the claim is ACTIVE/SUSPENDED. A unique index on this column
+  /// means a hostname can be *claimed* by many projects but *owned* by exactly one.
+  activeHostname       String?      @unique
+  status               DomainStatus @default(PENDING_VERIFICATION)
+  challengeToken       String
+  verifiedAt           DateTime?
+  lastCheckedAt        DateTime?
+  verificationFailures Int          @default(0)
+  tlsStatus            TlsStatus    @default(UNKNOWN)
+  tlsExpiresAt         DateTime?
+  tlsCheckedAt         DateTime?
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, hostname])
+  @@index([hostname])
+  @@index([status, lastCheckedAt])
+}
+
+model EnvironmentVariable {
+  id             String                @id @default(cuid())
+  projectId      String
+  key            String
+  environment    DeploymentEnvironment
+  scope          EnvScope              @default(BUILD_AND_RUNTIME)
+  valueEncrypted String
+  keyId          Int
+  updatedById    String?
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, key, environment])
+  @@index([projectId])
+}
+
+// ───────────────────────── Reliability: webhooks & outbox ─────────────────────────
+
+model WebhookDelivery {
+  id            String        @id @default(cuid())
+  deliveryId    String        @unique
+  event         String
+  action        String?
+  installationId BigInt?
+  repoId        BigInt?
+  status        WebhookStatus @default(RECEIVED)
+  detail        String?
+  payloadSha256 String
+  receivedAt    DateTime      @default(now())
+  processedAt   DateTime?
+
+  @@index([receivedAt])
+  @@index([status])
+}
+
+/// Transactional outbox: written in the same transaction as the state change it announces.
+model OutboxEvent {
+  id          String       @id @default(cuid())
+  type        String
+  aggregateId String
+  payload     Json
+  status      OutboxStatus @default(PENDING)
+  attempts    Int          @default(0)
+  lastError   String?
+  availableAt DateTime     @default(now())
+  createdAt   DateTime     @default(now())
+  sentAt      DateTime?
+
+  @@index([status, availableAt])
+  @@index([aggregateId])
+}
+
+// ───────────────────────── Audit & usage ─────────────────────────
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  orgId       String?
+  actorId     String?
+  action      String
+  targetType  String
+  targetId    String?
+  metadata    Json?
+  ip          String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  org   Organization? @relation(fields: [orgId], references: [id], onDelete: SetNull)
+  actor User?         @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([orgId, createdAt(sort: Desc)])
+  @@index([actorId])
+  @@index([targetType, targetId])
+}
+
+model UsageRecord {
+  id           String      @id @default(cuid())
+  orgId        String
+  projectId    String?
+  deploymentId String?
+  metric       UsageMetric
+  quantity     BigInt
+  createdAt    DateTime    @default(now())
+
+  org     Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  project Project?     @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  // makes usage recording idempotent for retried jobs
+  @@unique([deploymentId, metric])
+  @@index([orgId, metric, createdAt])
+}

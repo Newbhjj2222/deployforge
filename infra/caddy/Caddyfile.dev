@@ -1,0 +1,14 @@
+# Development: plain HTTP on host port 8080 (no certificates). Use *.localhost, which browsers resolve to loopback.
+{
+	auto_https off
+	admin off
+}
+
+http://app.localhost {
+	reverse_proxy web:3000
+}
+
+# everything else (<slug>.localhost, preview hosts) is routed by the edge using the Host header
+http:// {
+	reverse_proxy edge:8080
+}

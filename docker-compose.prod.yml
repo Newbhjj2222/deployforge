@@ -1,0 +1,154 @@
+# DeployForge PRODUCTION reference stack (single host). NOT verified in a live environment - read docs/operations.md first.
+#
+#   cp .env.example .env   # fill EVERY value; generate secrets with: openssl rand -base64 32
+#   docker compose -f docker-compose.prod.yml --env-file .env up -d --build
+#
+# Differences from the dev stack: no host ports except 80/443 on caddy, no dev-local-git, images pinned via build targets,
+# read-only root filesystems where possible, Postgres/Redis NOT published, log rotation enabled.
+# Host prerequisites: sudo ./infra/network/build-egress-firewall.sh  (blocks build containers from private ranges / metadata).
+name: deployforge-prod
+
+x-common: &common
+  restart: unless-stopped
+  logging: { driver: json-file, options: { max-size: '20m', max-file: '5' } }
+  security_opt: ['no-new-privileges:true']
+  cap_drop: [ALL]
+
+x-env: &env
+  env_file: .env
+  environment:
+    NODE_ENV: production
+    DATABASE_URL: postgresql://${POSTGRES_USER:-deployforge}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-deployforge}?schema=public
+
+services:
+  postgres:
+    <<: *common
+    image: postgres:16-alpine
+    cap_drop: []   # postgres entrypoint needs to chown its data dir
+    security_opt: []
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-deployforge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-deployforge}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    networks: [control]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-deployforge}']
+      interval: 10s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    <<: *common
+    image: redis:7-alpine
+    command: ['redis-server', '--appendonly', 'yes', '--maxmemory-policy', 'noeviction', '--requirepass', '${REDIS_PASSWORD:?set REDIS_PASSWORD}']
+    volumes: [redisdata:/data]
+    networks: [control]
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli -a "$$REDIS_PASSWORD" ping | grep -q PONG']
+      environment: { REDIS_PASSWORD: '${REDIS_PASSWORD}' }
+      interval: 10s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: { context: ., target: migrate }
+    <<: *env
+    depends_on: { postgres: { condition: service_healthy } }
+    networks: [control]
+    restart: 'no'
+
+  web:
+    <<: [*common, *env]
+    build: { context: ., target: web }
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    read_only: true
+    tmpfs: ['/tmp', '/app/apps/web/.next/cache']
+    networks: [control]
+
+  worker:
+    <<: [*common, *env]
+    build: { context: ., target: worker }
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      sandbox-agent: { condition: service_healthy }
+    volumes: [artifacts:/data/artifacts]
+    read_only: true
+    tmpfs: ['/tmp']
+    networks: [control]
+    stop_grace_period: 60s
+
+  edge:
+    <<: [*common, *env]
+    build: { context: ., target: edge }
+    depends_on: { migrate: { condition: service_completed_successfully } }
+    volumes: [artifacts:/data/artifacts:ro]
+    read_only: true
+    tmpfs: ['/tmp']
+    networks: [control, deployforge-runtime]
+
+  # The ONLY container with the Docker socket = root-equivalent on the host. See docs/security.md "Residual risks".
+  sandbox-agent:
+    restart: unless-stopped
+    logging: { driver: json-file, options: { max-size: '20m', max-file: '5' } }
+    build: { context: services/sandbox-agent }
+    environment:
+      SANDBOX_AGENT_TOKEN: ${SANDBOX_AGENT_TOKEN:?set SANDBOX_AGENT_TOKEN}
+      WORKSPACE_ROOT: /var/lib/deployforge/workspaces
+      WORKSPACE_HOST_ROOT: ${HOST_DATA_DIR:?set HOST_DATA_DIR}/workspaces
+      RUNTIME_ROOT: /var/lib/deployforge/runtimes
+      RUNTIME_HOST_ROOT: ${HOST_DATA_DIR}/runtimes
+      BUNDLE_ROOT: /var/lib/deployforge/bundles
+      BUILD_EGRESS_NETWORK: deployforge-build-egress
+      RUNTIME_NETWORK: deployforge-runtime
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOST_DATA_DIR}/workspaces:/var/lib/deployforge/workspaces
+      - ${HOST_DATA_DIR}/runtimes:/var/lib/deployforge/runtimes
+      - bundles:/var/lib/deployforge/bundles
+    networks: [control, deployforge-runtime]
+    healthcheck:
+      test: ['CMD', 'python', '-c', "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8700/healthz',timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  caddy:
+    <<: *common
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    image: caddy:2-alpine
+    ports: ['80:80', '443:443', '443:443/udp']
+    environment:
+      APP_HOST: ${APP_HOST:?set APP_HOST}
+      ROOT_DOMAIN: ${ROOT_DOMAIN:?set ROOT_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:?set INTERNAL_TOKEN}
+    volumes:
+      - ./infra/caddy/Caddyfile.prod:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [web, edge]
+    networks: [control]
+
+networks:
+  control: {}
+  deployforge-runtime:
+    name: deployforge-runtime
+    internal: true
+  deployforge-build-egress:
+    name: deployforge-build-egress
+    driver: bridge
+    driver_opts: { com.docker.network.bridge.name: df-build0 }
+    ipam: { config: [{ subnet: 172.30.0.0/24 }] }
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  artifacts: {}
+  bundles: {}
+  caddy_data: {}
+  caddy_config: {}
