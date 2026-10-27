@@ -6,13 +6,17 @@ WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
 
 FROM base AS deps
-COPY package.json package-lock.json* tsconfig.base.json ./
+
+COPY package.json tsconfig.base.json ./
 COPY packages/core/package.json packages/core/
 COPY packages/db/package.json packages/db/
+COPY packages/db/prisma packages/db/prisma/
 COPY apps/web/package.json apps/web/
 COPY apps/worker/package.json apps/worker/
 COPY apps/edge/package.json apps/edge/
-RUN --mount=type=cache,target=/root/.npm npm install --no-audit --no-fund
+
+RUN --mount=type=cache,target=/root/.npm \
+    npm install --include=dev --no-audit --no-fund
 
 FROM deps AS source
 COPY packages packages
