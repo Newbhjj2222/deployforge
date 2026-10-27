@@ -1,0 +1,46 @@
+
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "app": {
+      "root": ".",
+      "runtime": "container",
+      "entrypoint": "apps/edge/src/index.ts"
+    },
+    "web": {
+      "root": "apps/web",
+      "framework": "nextjs"
+    },
+    "worker": {
+      "root": ".",
+      "runtime": "container",
+      "entrypoint": "apps/worker/src/index.ts",
+      "bindings": [
+        {
+          "type": "service",
+          "service": "sandbox-agent",
+          "format": "url",
+          "env": "SANDBOX_AGENT_URL"
+        }
+      ]
+    },
+    "sandbox-agent": {
+      "root": "services/sandbox-agent",
+      "framework": "fastapi"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": {
+        "service": "web"
+      }
+    },
+    {
+      "source": "/(.*)",
+      "destination": {
+        "service": "app"
+      }
+    }
+  ]
+}
