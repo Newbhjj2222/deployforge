@@ -19,6 +19,15 @@ COPY packages packages
 COPY apps apps
 RUN npm run db:generate
 
+FROM deps AS source
+
+COPY packages packages
+COPY apps apps
+
+RUN npm ls @prisma/client prisma -w @deployforge/db
+
+RUN npm run db:generate
+
 FROM source AS web-build
 # placeholders are only used at build time so `next build` can import server modules; real values come at runtime
 ENV DATABASE_URL=postgresql://build:build@localhost:5432/build ENCRYPTION_KEYS=1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= ENCRYPTION_KEY_ACTIVE=1 AUTH_SECRET=build-time-only
