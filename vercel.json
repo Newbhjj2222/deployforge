@@ -3,10 +3,9 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "services": {
     "app": {
-  "root": ".",
-  "runtime": "container",
-  "entrypoint": "Dockerfile"
-}
+      "root": ".",
+      "runtime": "container",
+      "entrypoint": "Dockerfile"
     },
     "web": {
       "root": "apps/web",
@@ -15,7 +14,7 @@
     "worker": {
       "root": ".",
       "runtime": "container",
-      "entrypoint": "apps/worker/src/index.ts",
+      "entrypoint": "Dockerfile",
       "bindings": [
         {
           "type": "service",
