@@ -3,9 +3,10 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "services": {
     "app": {
-      "root": ".",
-      "runtime": "container",
-      "entrypoint": "apps/edge/src/index.ts"
+  "root": ".",
+  "runtime": "container",
+  "entrypoint": "Dockerfile"
+}
     },
     "web": {
       "root": "apps/web",
